@@ -48,26 +48,60 @@ class FusionScheduler:
     
     def _init_op_registry(self):
         """初始化算子注册表（用于回退执行）"""
+        # Initialize with empty registry first
+        self._op_registry = {}
+        
+        # 1. Try to register functional ops (silu, gelu, etc)
         try:
-            import infinicore
             import infinicore.nn.functional as F
-            
-            self._op_registry = {
+            self._op_registry.update({
                 "silu": F.silu,
                 "gelu": F.gelu,
                 "relu": F.relu,
-                "add": infinicore.add,
-                "mul": infinicore.mul,
-                # TODO: 添加更多算子
-            }
-            
-            # 尝试添加 rms_norm
+            })
             if hasattr(F, 'rms_norm'):
                 self._op_registry["rms_norm"] = F.rms_norm
+        except (ImportError, AttributeError):
+            # Fallback to torch.nn.functional for functional ops
+            try:
+                import torch
+                import torch.nn.functional as TorchF
+                self._op_registry.setdefault("silu", TorchF.silu)
+                self._op_registry.setdefault("gelu", TorchF.gelu)
+                self._op_registry.setdefault("relu", TorchF.relu)
                 
-        except ImportError:
-            if self.config.debug_mode:
-                print("[FusionScheduler] infinicore not fully available for fallback")
+                # Create a compatible rms_norm wrapper
+                # torch.rms_norm(input, normalized_shape, weight=None, eps=1e-5)
+                # Our graph passes (input, weight), so we adapt the signature
+                def _torch_rms_norm_wrapper(input_tensor, weight, eps=1e-5):
+                    # Infer normalized_shape from weight shape
+                    normalized_shape = weight.shape
+                    return TorchF.rms_norm(input_tensor, normalized_shape, weight, eps)
+                
+                self._op_registry.setdefault("rms_norm", _torch_rms_norm_wrapper)
+            except ImportError:
+                pass
+
+        # 2. Try to register core ops (add, mul, etc)
+        try:
+            import infinicore
+            self._op_registry.update({
+                "add": infinicore.add,
+                "mul": infinicore.mul,
+            })
+        except (ImportError, AttributeError):
+            # Fallback to torch for development/testing if infinicore is missing
+            try:
+                import torch
+                self._op_registry.setdefault("add", torch.add)
+                self._op_registry.setdefault("mul", torch.mul)
+            except ImportError:
+                pass
+
+        if self.config.debug_mode and not self._op_registry:
+            print("[FusionScheduler] Warning: No operators registered for fallback execution")
+                
+
     
     def dispatch(
         self,
@@ -128,19 +162,52 @@ class FusionScheduler:
         inputs: Dict[str, Any],
         graph: SubGraph
     ) -> Dict[str, Any]:
-        """执行融合内核"""
-        # 按照 graph.input_names 的顺序提取输入
-        ordered_inputs = [inputs[name] for name in graph.input_names]
+        """
+        执行融合内核
+        
+        ninetoothed 融合内核期望接收**每个原始内核的所有张量**作为参数，
+        顺序与编译时 Node 构建的顺序一致（不去重）。
+        
+        例如 SwiGLU (silu + mul):
+        - silu: (gate, gate_activated)
+        - mul: (gate_activated, up, output)
+        - 融合内核期望: (gate, gate_activated, gate_activated, up, output) = 5 个参数
+        """
+        import torch
+        
+        # 获取参考张量用于分配新张量
+        ref_tensor = next(iter(inputs.values()))
+        
+        # 先收集所有唯一张量名，用于预分配
+        unique_names = set()
+        for node in graph.nodes:
+            unique_names.update(node.inputs)
+            unique_names.update(node.outputs)
+        
+        # 构建张量字典：inputs 已有，其他需要分配
+        tensor_dict = dict(inputs)
+        for name in unique_names:
+            if name not in tensor_dict:
+                # 预分配与参考张量相同 shape/dtype 的新张量
+                tensor_dict[name] = torch.empty_like(ref_tensor)
+        
+        # 按照编译时的顺序构建参数列表（不去重，同名使用同一张量对象）
+        all_tensor_args = []
+        for node in graph.nodes:
+            for tensor_name in list(node.inputs) + list(node.outputs):
+                all_tensor_args.append(tensor_name)
+        
+        # 构建实际参数：用张量字典中的对象替换名称
+        ordered_args = [tensor_dict[name] for name in all_tensor_args]
+        
+        if self.config.debug_mode:
+            print(f"[FusionScheduler] Executing fused kernel with {len(ordered_args)} args: {all_tensor_args}")
         
         # 调用融合内核
-        result = compiled_kernel(*ordered_inputs)
+        compiled_kernel(*ordered_args)
         
-        # 包装输出
-        if len(graph.output_names) == 1:
-            return {graph.output_names[0]: result}
-        else:
-            # 多输出情况
-            return dict(zip(graph.output_names, result))
+        # 返回输出张量
+        return {name: tensor_dict[name] for name in graph.output_names}
     
     def _fallback_execute(
         self,

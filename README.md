@@ -1,90 +1,260 @@
-# Infini - 算子融合开发仓库
+# Infini 自动算子融合框架
 
-> **⚠️ 内部开发仓库** - 功能正在迭代中，API 可能变更
+> **内部开发仓库** - 实现 LLM 推理过程中的自动算子融合优化
 
-## 📍 项目状态总览
+---
 
-| 模块 | 状态 | 说明 |
+## 📍 项目目标
+
+**最终目标**：在 InfiniLM 推理对话过程中，自动识别可融合的算子组合，动态编译融合内核，实现 2-5x 性能提升。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  用户发送 Prompt → InfiniLM 推理 → 自动融合加速 → 返回响应       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🏗️ 模块关系图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      InfiniLM (推理引擎)                         │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  InferEngine (Python)                                    │   │
+│  │       ↓ pybind11                                         │   │
+│  │  _infinilm.InferEngine (C++)                             │   │
+│  │       ↓                                                  │   │
+│  │  LlamaForCausalLM → LlamaDecoderLayer                    │   │
+│  │       ↓                    ↓                             │   │
+│  │  [Attention]          [MLP (SwiGLU)]  ← 融合点 ★          │   │
+│  │       ↓                    ↓                             │   │
+│  │  [Add + RMSNorm]  ← 融合点 ★                              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              ↓                                  │
+│                    调用 InfiniCore 算子                          │
+└──────────────────────────────┬──────────────────────────────────┘
+                               ↓
+┌──────────────────────────────┴──────────────────────────────────┐
+│                     InfiniCore (算子库)                          │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  infinicore.nn.functional.silu/gelu/relu/rms_norm        │   │
+│  │  infinicore.add / infinicore.mul                         │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              ↓                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  fusion/ (本项目核心)                                     │   │
+│  │    ├── FusionScheduler   ← 运行时调度器                   │   │
+│  │    ├── FusionHeuristics  ← 融合决策 (静态规则/Profile)    │   │
+│  │    ├── KernelCompiler    ← 调用 ninetoothed 编译         │   │
+│  │    └── SubGraph/OpNode   ← 子图数据结构                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└──────────────────────────────┬──────────────────────────────────┘
+                               ↓
+┌──────────────────────────────┴──────────────────────────────────┐
+│                 ninetoothed + ntops (编译后端)                   │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  ninetoothed.make()     → 创建内核句柄                    │   │
+│  │  ninetoothed.fusion     → 融合多个内核                    │   │
+│  │  ntops.kernels.*        → 算子 premake 函数               │   │
+│  │       ↓                                                  │   │
+│  │  Triton Kernel          → GPU 执行                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🎯 分阶段目标
+
+### Phase 1: 核心机制 ✅ 已完成
+
+| 任务 | 状态 | 说明 |
 |------|------|------|
-| `FusionScheduler` | ✅ 核心完成 | 调度、缓存、回退逻辑可用 |
-| `SubGraph`/`OpNode` | ✅ 完成 | 数据结构可工作 |
-| `FusionHeuristics` | ✅ 完成 | 静态启发式规则 |
-| `KernelCompiler` | ⚠️ 部分完成 | 编译链路存在但端到端融合未验证 |
-| `ninetoothed` 交互 | ⚠️ 需要验证 | Node 构建逻辑可能有问题 |
-| InfiniLM 集成 | ❌ 未开始 | 推理引擎尚未接入融合调度器 |
-| 性能基准 | ❌ 未验证 | README 中的性能数据是预估值 |
+| SubGraph/OpNode 数据结构 | ✅ | 不可变、可哈希的子图表示 |
+| FusionConfig 配置 | ✅ | enable_fusion, min_nodes, fallback_on_error 等 |
+| FusionHeuristics 静态规则 | ✅ | 算子白名单、张量大小阈值 |
+| KernelCompiler | ✅ | 调用 ninetoothed 编译融合内核 |
+| FusionScheduler 调度器 | ✅ | 缓存、分发、回退机制 |
+| 单元测试 | ✅ | 18 个测试通过 |
+| SwiGLU 端到端验证 | ✅ | 融合路径验证成功 |
+
+### Phase 2: 融合决策机制 ⬜ 设计中
+
+**目标**：基于 Profile 时间决定是否融合（而非仅靠静态规则）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    融合决策流程                                   │
+├─────────────────────────────────────────────────────────────────┤
+│  输入: SubGraph (算子序列)                                       │
+│    ↓                                                            │
+│  [1] 静态规则检查 (当前已有)                                      │
+│      - 算子白名单 ✅                                             │
+│      - 节点数 >= min_nodes ✅                                    │
+│      - 张量大小 >= min_tensor_elements ✅                        │
+│    ↓                                                            │
+│  [2] Profile 决策 (待实现)                                       │
+│      - 首次遇到: 运行 Fallback 并记录时间 T_fallback             │
+│      - 编译融合内核并运行: 记录时间 T_fused                       │
+│      - 如果 T_fused < T_fallback × ratio: 缓存融合内核           │
+│      - 否则: 标记为"不融合"，后续直接走回退                        │
+│    ↓                                                            │
+│  [3] 缓存复用                                                   │
+│      - cache_key = hash(graph + dtypes + shapes)                │
+│      - 命中缓存: 直接执行融合内核                                 │
+│      - 未命中: 走 [2]                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**需要实现的接口**：
+
+```python
+class FusionHeuristics:
+    def should_fuse(self, graph, input_shapes) -> bool:
+        """静态规则判断"""
+        ...
+    
+    def profile_and_decide(self, graph, inputs) -> bool:
+        """Profile 决策 (待实现)"""
+        t_fallback = self._benchmark_fallback(graph, inputs)
+        t_fused = self._benchmark_fused(graph, inputs)
+        return t_fused < t_fallback * self.config.fusion_ratio
+```
+
+**待办事项**：
+- [ ] 实现 `_benchmark_fallback()` 和 `_benchmark_fused()`
+- [ ] 添加 `profile_cache` 存储 Profile 结果
+- [ ] 添加 `fusion_ratio` 配置项 (默认 0.8 = 20% 加速才融合)
+
+### Phase 3: InfiniLM 集成 ⬜ 阻塞中
+
+**当前挑战**：InfiniLM 有两条推理路径
+
+| 路径 | 实现 | 融合集成难度 |
+|------|------|-------------|
+| **路径 A: Python** | `modeling_llama.py` | ✅ 简单 - 已有融合代码分支 |
+| **路径 B: C++** | `csrc/` + pybind11 | ❌ 困难 - 需要 C++ 层改动 |
+
+**问题**：当前 `InferEngine` 使用 C++ 后端，Python 侧融合代码不会被调用。
+
+```
+用户调用 InferEngine.forward()
+    ↓
+pybind11 调用 C++ InferEngine::forward()
+    ↓
+C++ LlamaDecoderLayer::forward()  ← 这里执行实际计算
+    ↓
+C++ 算子 (InfiniCore C++ API)     ← Python FusionScheduler 无法介入
+```
+
+**解决方案选项**：
+
+| 方案 | 描述 | 难度 | 推荐 |
+|------|------|------|------|
+| A | 在 C++ 层实现 FusionScheduler | 高 | 生产方案 |
+| B | 创建 Python-only 推理路径 | 中 | 验证方案 ✅ |
+| C | 通过 JIT 劫持 C++ 调用 | 高 | 不推荐 |
+
+**方案 B 实施步骤** (推荐先做):
+
+```python
+# 新文件: InfiniLM/python/infinilm/infer_engine_python.py
+
+class InferEnginePython:
+    """纯 Python 推理引擎，用于验证融合效果"""
+    
+    def __init__(self, model_path, device, enable_fusion=True):
+        self.model = LlamaForCausalLM.from_pretrained(model_path, device)
+        self.model.config.enable_fusion = enable_fusion
+    
+    def forward(self, input_ids, **kwargs):
+        return self.model.forward(input_ids, **kwargs)
+```
+
+### Phase 4: 性能验证与优化 ⬜ 待开始
+
+- [ ] 端到端 Benchmark (Prefill + Decode 延迟)
+- [ ] 吞吐量对比 (tok/s)
+- [ ] 内存占用分析
+- [ ] 更多融合模式 (GEGLU, Attention 内融合)
 
 ---
 
-## 🚧 已知问题 & TODO
+## 📊 当前实现状态
 
-### 高优先级
+### 代码结构
 
-1. **`KernelCompiler._build_fusion_nodes` 可能有问题**
-   - 当前传入空 `args=()` 给 `Node`，不确定是否能正确建立数据依赖
-   - 文件: `InfiniCore/python/infinicore/fusion/kernel_compiler.py:297-298`
-   - 需有 GPU 环境实际测试
+```
+Infini/
+├── InfiniCore/python/infinicore/fusion/    # 本项目核心
+│   ├── __init__.py             # 导出 FusionScheduler 等
+│   ├── fusion_scheduler.py     # ⭐ 运行时调度器 (240 行)
+│   ├── fusion_config.py        # 配置 dataclass
+│   ├── heuristics.py           # 静态启发式规则
+│   ├── subgraph.py             # OpNode, SubGraph 数据结构
+│   ├── kernel_compiler.py      # ninetoothed 编译封装
+│   └── patterns/
+│       └── llm_patterns.py     # SwiGLU, Add+RMSNorm 模式
+│
+├── InfiniLM/python/infinilm/
+│   ├── fusion_utils.py         # FusionManager, LLMFusionContext
+│   └── models/llama/
+│       └── modeling_llama.py   # LlamaMLP/LlamaDecoderLayer 融合分支
+│
+├── ninetoothed/                 # 符号化内核编译器
+│   └── src/ninetoothed/
+│       ├── fusion.py           # _fuse_nodes, Node 类
+│       └── make.py             # make() 创建内核句柄
+│
+└── ntops/                       # 算子库
+    └── kernels/
+        ├── silu.py, gelu.py    # premake() 函数
+        ├── add.py, mul.py
+        └── rms_norm.py
+```
 
-2. **端到端融合路径未实测**
-   - `test_fusion_ntops.py` 和 `test_fusion_integration.py` 需要 CUDA + ntops + ninetoothed 环境
-   - 回退路径 (`enable_fusion=False`) 已验证可用
+### 测试状态
 
-3. **`rms_norm` 算子签名**  
-   - 回退注册表只有 `rms_norm` 不确定 attrs 格式是否对
-   - 文件: `fusion_scheduler.py:64-66`
-
-### 中优先级
-
-1. **缺少更多 LLM 融合模式**
-   - 目前只有 `SwiGLU` 和 `Add+RMSNorm`
-   - 可扩展: `GEGLU`, `LayerNorm+FFN`, `Attention` 内融合
-
-2. **InfiniLM 接入点尚未确定**
-   - 需要决定在 model forward 的哪个层级插入调度器
-
-3. **算子注册表同步**
-   - `heuristics.py` 和 `kernel_compiler.py` 各维护一份白名单，容易不同步
+| 测试文件 | 状态 | 说明 |
+|----------|------|------|
+| `test_fusion_scheduler.py` | ✅ 18 passed | 无 GPU 可运行 |
+| `test_fusion_integration.py` | ⚠️ 需 CUDA | Handle 创建测试 |
+| `test_fusion_ntops.py` | ✅ 3 passed | SwiGLU 融合验证 |
+| `bench_fusion.py` | ⚠️ 需 CUDA | 性能基准测试 |
 
 ---
 
-## 🏗️ 代码结构
+## � 下一步行动
 
-```
-InfiniCore/python/infinicore/fusion/
-├── __init__.py              # 导出: FusionScheduler, FusionConfig, SubGraph, OpNode
-├── fusion_scheduler.py      # ⭐ 核心调度器 (225 行)
-├── fusion_config.py         # 配置 dataclass
-├── heuristics.py            # 静态启发式规则
-├── subgraph.py              # OpNode, SubGraph 数据结构
-├── kernel_compiler.py       # ninetoothed 编译封装 (有风险)
-└── patterns/
-    ├── __init__.py
-    └── llm_patterns.py      # SwiGLU, Add+RMSNorm 模式定义
+### 立即可做 (无阻塞)
 
-InfiniCore/test/infinicore/
-├── test_fusion_scheduler.py    # ✅ 18 个单元测试
-├── test_fusion_integration.py  # ⚠️ 需 CUDA
-├── test_fusion_ntops.py        # ⚠️ 需 CUDA + ntops + ninetoothed
-└── bench_fusion.py             # ⚠️ 需 CUDA
-```
+1. **添加 Profile 决策机制**
+   - 文件: `heuristics.py`
+   - 实现: `profile_and_decide()` 方法
+
+2. **添加 `enable_fusion` 到 LlamaConfig**
+   - 文件: `infinilm/models/llama/configuration_llama.py`
+   - 验证: `python InfiniLM/test_llama_fusion.py`
+
+### 短期 (需要决策)
+
+3. **创建 Python-only 推理验证脚本**
+   - 目的: 绕过 C++ 后端，验证融合效果
+   - 新文件: `InfiniLM/examples/llama_fusion_demo.py`
+
+### 中期 (需要更多投入)
+
+4. **C++ 层融合集成** (如选择方案 A)
+   - 需要修改: `csrc/layers/`, `csrc/models/`
+   - 评估: 是否值得在 C++ 层重新实现调度器
 
 ---
 
-## 🚀 快速开始
+## 💻 快速开始
 
-### 环境准备
-
-```bash
-cd /path/to/Infini/InfiniCore
-
-# 基础安装
-pip install -e .
-
-# GPU 融合支持 (可选)
-pip install ninetoothed ntops torch triton
-```
-
-### 运行单元测试 (无 GPU)
+### 运行单元测试
 
 ```bash
 cd InfiniCore
@@ -92,145 +262,37 @@ python -m pytest test/infinicore/test_fusion_scheduler.py -v
 # 预期: 18 passed
 ```
 
-### GPU 测试 (需要 CUDA)
+### 运行 GPU 集成测试
 
 ```bash
-source ../activate_infini_env.sh  # 如有环境脚本
-
-# 集成测试
-python -m pytest test/infinicore/test_fusion_integration.py -v
-
-# ntops 对接测试
+cd InfiniCore
+export PYTHONPATH=$PYTHONPATH:$(pwd)/python
 python -m pytest test/infinicore/test_fusion_ntops.py -v
-
-# 性能基准
-python test/infinicore/bench_fusion.py --batch_size 32 --hidden_dim 4096
+# 预期: 3 passed
 ```
 
----
-
-## 💻 基本用法
-
-### 回退模式 (fusion 关闭，稳定可用)
-
-```python
-from infinicore.fusion import FusionScheduler, FusionConfig, SubGraph, OpNode
-
-config = FusionConfig(enable_fusion=False)  # 禁用融合
-scheduler = FusionScheduler(config)
-
-graph = SubGraph(
-    nodes=(
-        OpNode("silu", ("x",), ("y1",)),
-        OpNode("mul", ("y1", "x"), ("y2",)),
-    ),
-    input_names=("x",),
-    output_names=("y2",),
-)
-
-# 这会走 infinicore.nn.functional 的标准算子
-outputs = scheduler.dispatch(graph, {"x": tensor_x})
-```
-
-### 融合模式 (实验性)
+### 基本用法
 
 ```python
 from infinicore.fusion import FusionScheduler, FusionConfig
 from infinicore.fusion.patterns.llm_patterns import create_swiglu_pattern
 
-config = FusionConfig(
-    enable_fusion=True,
-    enable_cache=True,
-    debug_mode=True,       # 打印调试信息
-    fallback_on_error=True # 编译失败自动回退
-)
+# 创建调度器
+config = FusionConfig(enable_fusion=True, debug_mode=True)
 scheduler = FusionScheduler(config)
 
+# 执行 SwiGLU 融合
 graph = create_swiglu_pattern()
 outputs = scheduler.dispatch(graph, {"gate": gate_tensor, "up": up_tensor})
 ```
 
 ---
 
-## 🔧 配置选项
+## � 相关文档
 
-```python
-@dataclass
-class FusionConfig:
-    enable_fusion: bool = True        # 总开关
-    enable_cache: bool = True         # 缓存编译后的内核
-    min_tensor_elements: int = 1024   # 最小张量大小才融合
-    min_nodes_for_fusion: int = 2     # 最少节点数
-    fallback_on_error: bool = True    # 编译失败自动回退
-    debug_mode: bool = False          # 详细日志
-```
-
----
-
-## 📦 依赖项目
-
-| 项目 | 路径 | 说明 |
-|------|------|------|
-| ninetoothed | `../ninetoothed` | 符号化内核编译器，生成 Triton |
-| ntops | `../ntops` | 算子库，提供 `premake` 函数 |
-| InfiniLM | `../InfiniLM` | 推理引擎 (待接入) |
-| InfiniTrain | `../InfiniTrain` | 训练框架 |
-
----
-
-## 🧪 开发任务
-
-### 接下来要做
-
-- [ ] 在 GPU 环境验证 `KernelCompiler.compile` 端到端
-- [ ] 修复 `_build_fusion_nodes` 的 args 传递问题
-- [ ] 在 InfiniLM 中选择接入点
-- [ ] 添加更多融合模式 (GEGLU 等)
-
-### 如何添加新融合模式
-
-1. 在 `patterns/llm_patterns.py` 添加函数:
-```python
-def create_my_pattern() -> SubGraph:
-    return SubGraph(nodes=(...), ...)
-```
-
-2. 确保算子在白名单中:
-   - `heuristics.py`: `_DEFAULT_OP_WHITELIST`
-   - `kernel_compiler.py`: `_OP_REGISTRY`
-
-3. 添加测试到 `test_fusion_scheduler.py`
-
-### 如何调试
-
-```python
-config = FusionConfig(debug_mode=True, enable_fusion=True)
-scheduler = FusionScheduler(config)
-
-# 会打印:
-# [FusionScheduler] Cache hit: xxx 或 Cache miss
-# [KernelCompiler] Compiling graph: ...
-# [FusionScheduler] Fallback execution for graph with N nodes
-```
-
----
-
-## 📝 相关文档
-
-- `InfiniCore/test/infinicore/FusionScheduler 单元测试操作说明.md`
-- `InfiniCore/test/infinicore/FusionScheduler_测试报告.md`
-- `CLAUDE.md` - AI 助手指引
-
----
-
-## ⚡ 性能预期 (待验证)
-
-以下数据为设计目标，**尚未实测验证**:
-
-| 操作 | 标准执行 | 融合执行 | 预期加速 |
-|------|---------|---------|---------|
-| SwiGLU (4096×32) | ~0.45 ms | ~0.18 ms | ~2.5x |
-| Add+RMSNorm (4096×32) | ~0.52 ms | ~0.22 ms | ~2.4x |
+- [InfiniLM 架构文档](InfiniLM/CODEREADME_ANALYSIS.md) - 双轨推理路径详解
+- [ninetoothed 文档](ninetoothed/README.md) - 符号化内核编译
+- [ntops 文档](ntops/README.md) - 算子 premake API
 
 ---
 

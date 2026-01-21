@@ -294,8 +294,9 @@ class KernelCompiler:
             handle = handles[op_node.op_type]
             
             # Node 需要 args 来建立数据依赖关系
-            # 在编译时，我们传入空元组；运行时会根据 graph 的输入输出名重建
-            node = Node(handle, args=(), kwargs={})
+            # 传入 inputs + outputs 作为参数，让 ninetoothed 能识别共享的数据对象（这里是字符串名）
+            node_args = list(op_node.inputs) + list(op_node.outputs)
+            node = Node(handle, args=tuple(node_args), kwargs={})
             nodes.append(node)
         
         return nodes

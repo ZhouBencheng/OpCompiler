@@ -26,6 +26,18 @@ class Node:
         self.kwargs = kwargs
 
 
+def _fuse_nodes(nodes):
+    if len(nodes) == 1:
+        return (Node(nodes[0].kernel, args=nodes[0].args, kwargs=nodes[0].kwargs),)
+
+    fused = functools.reduce(_fuse_node_pair, nodes)
+
+    if fused is None:
+        return nodes
+
+    return (fused,)
+
+
 def fuser(graph_module, _example_inputs):
     graph = graph_module.graph
 
@@ -46,17 +58,6 @@ def fuser(graph_module, _example_inputs):
                 return False
 
         return True
-
-    def _fuse_nodes(nodes):
-        if len(nodes) == 1:
-            return (Node(nodes[0].kernel, args=nodes[0].args, kwargs=nodes[0].kwargs),)
-
-        fused = functools.reduce(_fuse_node_pair, nodes)
-
-        if fused is None:
-            return nodes
-
-        return (fused,)
 
     for node in graph.nodes:
         if isinstance(node.target, ninetoothed.jit.__globals__["_Handle"]):
@@ -230,7 +231,7 @@ def _fuse_arrangement_pair(input_kernel, other_kernel, mapping):
                 if not (
                     Symbol.is_name(block_size) and naming.is_meta(block_size.node.id)
                 ):
-                    return None, None
+                    return None, None, None
 
             new_lower_bound = max(
                 input_block_size.lower_bound, other_block_size.lower_bound
@@ -255,7 +256,7 @@ def _fuse_arrangement_pair(input_kernel, other_kernel, mapping):
     )
 
     if fusion_info is None:
-        return None, None
+        return None, None, None
 
     input_prefix = fusion_info.input_prefix
     input_suffix = fusion_info.input_suffix
