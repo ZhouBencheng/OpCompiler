@@ -130,6 +130,70 @@ class FusionHeuristics:
 
 ### Phase 3: InfiniLM 集成 ⬜ 阻塞中
 
+**🔑 关键发现：InfiniCore Graph Recording 机制**
+
+InfiniCore 已有运行时图录制机制，可以作为 FusionScheduler 的输入源！
+
+```python
+# 现有 API (infinicore/context.py)
+import infinicore
+
+# 1. 开始录制
+infinicore.start_graph_recording()
+
+# 2. 执行算子（会被录制而非立即执行）
+c = infinicore.matmul(a, b)
+d = infinicore.add(c, bias)
+
+# 3. 停止录制，获得 Graph 对象
+graph = infinicore.stop_graph_recording()
+
+# 4. 执行录制的图
+graph.run()
+```
+
+**集成思路**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  InfiniLM 推理流程 (改进后)                                       │
+├─────────────────────────────────────────────────────────────────┤
+│  LlamaDecoderLayer.forward()                                    │
+│       ↓                                                         │
+│  infinicore.start_graph_recording() ← 开始录制                   │
+│       ↓                                                         │
+│  [原始算子调用: silu, mul, add, rms_norm...]                      │
+│       ↓                                                         │
+│  recorded_graph = infinicore.stop_graph_recording() ← 停止录制   │
+│       ↓                                                         │
+│  ┌── FusionScheduler.analyze(recorded_graph) ──┐                │
+│  │   分析录制的图，识别融合模式                    │                │
+│  │   - 转换 recorded_graph → SubGraph            │                │
+│  │   - 调用 KernelCompiler 编译融合内核           │                │
+│  └────────────────────────────────────────────┘                │
+│       ↓                                                         │
+│  fused_kernel() 或 recorded_graph.run() ← 执行                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**待实现的转换接口**：
+
+```python
+# 新增: infinicore/fusion/graph_converter.py
+
+def convert_recorded_graph_to_subgraph(recorded_graph: infinicore.Graph) -> SubGraph:
+    """
+    将 InfiniCore 录制的 Graph 转换为 FusionScheduler 可处理的 SubGraph。
+    
+    1. 遍历 recorded_graph 中的算子节点
+    2. 提取算子类型、输入、输出名称
+    3. 构建 OpNode 序列
+    4. 返回 SubGraph
+    """
+    # TODO: 需要访问 recorded_graph._graph 的内部结构
+    pass
+```
+
 **当前挑战**：InfiniLM 有两条推理路径
 
 | 路径 | 实现 | 融合集成难度 |
