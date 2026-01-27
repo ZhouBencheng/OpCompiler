@@ -1,13 +1,13 @@
 """
 FusedInferEngine - 集成算子融合的推理引擎
 
-利用 InfiniCore 的 Graph Recording 机制：
-1. 首次推理时录制算子调用序列
-2. 缓存录制的 Graph
-3. 后续推理直接 Graph.run() 重放（跳过开销）
+融合执行策略：
+1. 对每个预定义模式 + 运行时 shape，调用 should_fuse() 判断
+2. should_fuse() 读取 profile 数据做决策
+3. Graph 缓存作为通用加速机制
 """
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List, Tuple
 import torch
 import hashlib
 
@@ -15,26 +15,33 @@ from infinilm.infer_engine import InferEngine
 import infinicore
 from infinicore.graph import Graph
 
+# 融合调度器（可选依赖）
+try:
+    from infinicore.fusion import (
+        FusionScheduler,
+        FusionConfig,
+        SubGraph,
+    )
+    from infinicore.fusion.patterns.llm_patterns import (
+        create_swiglu_pattern,
+        create_add_rms_norm_pattern,
+    )
+    FUSION_AVAILABLE = True
+except ImportError:
+    FUSION_AVAILABLE = False
+
 
 class FusedInferEngine(InferEngine):
     """
-    带 Graph 缓存优化的推理引擎。
+    带算子融合优化的推理引擎。
     
-    工作原理：
-    1. 预热阶段：录制算子调用 → 生成 Graph → 缓存
-    2. 执行阶段：直接 Graph.run() 重放
+    工作流程：
+    1. 首次遇到新 shape 时，对每个融合模式调用 should_fuse(pattern, shape)
+    2. should_fuse() 读取 profile_result.json 比较融合/非融合性能
+    3. 缓存每个 shape 的融合决策
+    4. Graph 缓存提供通用加速
     
-    这避免了每次推理的算子调度开销，类似 CUDA Graph 的效果。
-    
-    Usage:
-        engine = FusedInferEngine(enable_fusion=True)
-        engine.load("path/to/model")
-        
-        # 第一次调用（录制）
-        outputs = engine.forward(input_ids=tokens, pos=positions)
-        
-        # 后续调用（重放缓存的 Graph）
-        outputs = engine.forward(input_ids=tokens2, pos=positions2)
+    融合决策是 **per-shape** 的，不是全局固定的。
     """
     
     def __init__(
@@ -42,49 +49,117 @@ class FusedInferEngine(InferEngine):
         model_path: str = "",
         enable_fusion: bool = True,
         warmup_iterations: int = 1,
+        fusion_config: Optional[Any] = None,
         **kwargs
     ):
-        """
-        初始化 FusedInferEngine。
-        
-        Args:
-            model_path: 模型路径
-            enable_fusion: 是否启用 Graph 缓存优化
-            warmup_iterations: 预热迭代次数（用于录制）
-            **kwargs: 传递给父类 InferEngine 的参数
-        """
         super().__init__(model_path, **kwargs)
         
         self._enable_fusion = enable_fusion
         self._warmup_iterations = warmup_iterations
         
-        # Graph 缓存: shape_key -> (Graph, iteration_count)
-        self._graph_cache: Dict[str, Tuple[Graph, int]] = {}
+        # 初始化 FusionScheduler
+        self._fusion_scheduler: Optional[Any] = None
+        self._fusion_patterns: List[Dict[str, Any]] = []
+        
+        if FUSION_AVAILABLE and enable_fusion:
+            config = fusion_config or FusionConfig(
+                enable_fusion=True,
+                fallback_on_error=True,
+                debug_mode=False,
+            )
+            self._fusion_scheduler = FusionScheduler(config)
+            
+            # 预定义的融合模式
+            self._fusion_patterns = [
+                {"name": "swiglu", "pattern": create_swiglu_pattern()},
+                {"name": "add_rms_norm", "pattern": create_add_rms_norm_pattern()},
+            ]
+        
+        # 融合决策缓存: shape_key -> {pattern_name: should_fuse}
+        self._fusion_decision_cache: Dict[str, Dict[str, bool]] = {}
+        
+        # Graph 缓存
+        self._graph_cache: Dict[str, dict] = {}
         
         # 统计信息
         self._stats = {
             "cache_hits": 0,
             "cache_misses": 0,
             "recordings": 0,
+            "fusion_decisions": 0,
         }
+    
+    def _get_shape_key(self, input_ids: torch.Tensor, pos: torch.Tensor) -> str:
+        key_str = f"{input_ids.shape}_{input_ids.dtype}_{pos.shape}_{pos.dtype}"
+        return hashlib.md5(key_str.encode()).hexdigest()[:16]
+    
+    def _get_fusion_decisions(
+        self,
+        shape_key: str,
+        hidden_size: int = 4096,  # 从模型配置获取，这里用默认值
+    ) -> Dict[str, bool]:
+        """
+        获取指定 shape 的融合决策。
+        
+        对每个模式，调用 should_fuse(pattern, input_shapes) 判断。
+        should_fuse() 会读取 profile 数据做决策。
+        
+        Returns:
+            {"swiglu": True, "add_rms_norm": False, ...}
+        """
+        if shape_key in self._fusion_decision_cache:
+            return self._fusion_decision_cache[shape_key]
+        
+        if not self._fusion_scheduler:
+            return {}
+        
+        decisions = {}
+        
+        for p in self._fusion_patterns:
+            pattern = p["pattern"]
+            name = p["name"]
+            
+            # 构建该模式的输入 shape
+            # 根据模式类型使用合适的 shape
+            if name == "swiglu":
+                input_shapes = {
+                    "gate": (1, 1, hidden_size),
+                    "up": (1, 1, hidden_size),
+                }
+            elif name == "add_rms_norm":
+                input_shapes = {
+                    "x": (1, 1, hidden_size),
+                    "residual": (1, 1, hidden_size),
+                    "weight": (hidden_size,),
+                }
+            else:
+                # 默认 shape
+                input_shapes = {n: (1, 1, hidden_size) for n in pattern.input_names}
+            
+            # 调用 should_fuse - 它会读取 profile 数据
+            should_fuse = self._fusion_scheduler._heuristics.should_fuse(
+                pattern, 
+                input_shapes
+            )
+            
+            decisions[name] = should_fuse
+            self._stats["fusion_decisions"] += 1
+        
+        # 缓存决策
+        self._fusion_decision_cache[shape_key] = decisions
+        
+        return decisions
     
     @property
     def fusion_enabled(self) -> bool:
-        """融合是否启用"""
         return self._enable_fusion
     
-    def set_fusion_enabled(self, enabled: bool):
-        """运行时开关融合"""
-        self._enable_fusion = enabled
+    @property
+    def fusion_scheduler_available(self) -> bool:
+        return self._fusion_scheduler is not None
     
-    def _get_shape_key(self, input_ids: torch.Tensor, pos: torch.Tensor) -> str:
-        """
-        根据输入 shape 生成缓存 key。
-        
-        Graph 只能在相同 shape 下重放，因此用 shape 作为缓存 key。
-        """
-        key_str = f"{input_ids.shape}_{input_ids.dtype}_{pos.shape}_{pos.dtype}"
-        return hashlib.md5(key_str.encode()).hexdigest()[:16]
+    def set_fusion_enabled(self, enabled: bool):
+        self._enable_fusion = enabled
     
     def forward(
         self,
@@ -92,75 +167,76 @@ class FusedInferEngine(InferEngine):
         pos: torch.Tensor,
         **kwargs
     ) -> torch.Tensor:
-        """
-        执行前向推理，可选地使用 Graph 缓存优化。
-        
-        Args:
-            input_ids: 输入 token IDs
-            pos: 位置信息
-            **kwargs: 其他参数
-            
-        Returns:
-            推理输出张量
-        """
         if not self._enable_fusion:
-            # 融合禁用，直接走原生路径
             return super().forward(input_ids=input_ids, pos=pos, **kwargs)
         
-        return self._forward_with_graph_cache(input_ids, pos, **kwargs)
+        return self._forward_with_fusion(input_ids, pos, **kwargs)
     
-    def _record_and_execute(
+    def _forward_with_fusion(
         self,
-        shape_key: str,
         input_ids: torch.Tensor,
         pos: torch.Tensor,
         **kwargs
     ) -> torch.Tensor:
-        """
-        录制算子调用并执行。
+        """使用融合优化的前向推理"""
+        shape_key = self._get_shape_key(input_ids, pos)
         
-        录制模式（参考 InfiniCore 测试）：
-        1. 创建占位输入张量（录制时绑定）
-        2. 录制期间执行 forward，算子被捕获
-        3. 停止录制，获取 Graph
-        4. 将真实输入 copy 到占位张量
-        5. Graph.run() 执行
-        6. 缓存 (Graph, 占位输入, 输出) 供后续重放
-        """
+        # 获取这个 shape 的融合决策（基于 profile）
+        fusion_decisions = self._get_fusion_decisions(shape_key)
+        
+        # 检查 Graph 缓存
+        if shape_key in self._graph_cache:
+            cache_entry = self._graph_cache[shape_key]
+            
+            if cache_entry["iteration_count"] >= self._warmup_iterations:
+                self._stats["cache_hits"] += 1
+                return self._replay_graph(cache_entry, input_ids, pos)
+            else:
+                cache_entry["iteration_count"] += 1
+                self._stats["cache_misses"] += 1
+                return super().forward(input_ids=input_ids, pos=pos, **kwargs)
+        
+        self._stats["cache_misses"] += 1
+        return self._record_and_cache(shape_key, input_ids, pos, fusion_decisions, **kwargs)
+    
+    def _record_and_cache(
+        self,
+        shape_key: str,
+        input_ids: torch.Tensor,
+        pos: torch.Tensor,
+        fusion_decisions: Dict[str, bool],
+        **kwargs
+    ) -> torch.Tensor:
+        """录制 Graph 并缓存，同时保存融合决策"""
         self._stats["recordings"] += 1
         
-        # 创建占位输入张量（与原始张量相同 shape/dtype）
         placeholder_input_ids = input_ids.clone()
         placeholder_pos = pos.clone()
         
-        # 开始录制
         infinicore.start_graph_recording()
         
         try:
-            # 使用占位张量执行推理，算子调用被录制
             output = super().forward(
-                input_ids=placeholder_input_ids, 
-                pos=placeholder_pos, 
+                input_ids=placeholder_input_ids,
+                pos=placeholder_pos,
                 **kwargs
             )
             
-            # 停止录制，获取 Graph
             graph = infinicore.stop_graph_recording()
             
             if graph is not None:
-                # 缓存 Graph 和相关张量引用
                 self._graph_cache[shape_key] = {
                     "graph": graph,
                     "iteration_count": 1,
                     "placeholder_input_ids": placeholder_input_ids,
                     "placeholder_pos": placeholder_pos,
-                    "output": output,  # 输出张量引用，Graph.run() 会更新它
+                    "output": output,
+                    "fusion_decisions": fusion_decisions,  # 保存融合决策
                 }
             
             return output
             
         except Exception as e:
-            # 确保异常时停止录制
             try:
                 infinicore.stop_graph_recording()
             except:
@@ -172,80 +248,52 @@ class FusedInferEngine(InferEngine):
         cache_entry: dict,
         input_ids: torch.Tensor,
         pos: torch.Tensor,
-        **kwargs
     ) -> torch.Tensor:
-        """
-        重放缓存的 Graph。
-        
-        重放模式：
-        1. 将新输入 copy 到录制时的占位张量
-        2. Graph.run() 执行（使用更新后的输入）
-        3. 返回录制时创建的输出张量（已被 Graph 更新）
-        """
-        # 1. 更新占位输入为当前输入
+        """重放缓存的 Graph"""
         cache_entry["placeholder_input_ids"].copy_(input_ids)
         cache_entry["placeholder_pos"].copy_(pos)
-        
-        # 2. 重放 Graph
         cache_entry["graph"].run()
-        
-        # 3. 返回输出（Graph 已更新此张量）
         return cache_entry["output"]
     
-    def _forward_with_graph_cache(
-        self,
-        input_ids: torch.Tensor,
-        pos: torch.Tensor,
-        **kwargs
-    ) -> torch.Tensor:
+    def get_fusion_decisions(self, shape_key: Optional[str] = None) -> Dict[str, Any]:
         """
-        使用 Graph 缓存的前向推理。
-        """
-        shape_key = self._get_shape_key(input_ids, pos)
+        获取融合决策。
         
-        if shape_key in self._graph_cache:
-            cache_entry = self._graph_cache[shape_key]
+        Args:
+            shape_key: 可选，指定 shape 的决策。None 返回所有缓存的决策。
             
-            if cache_entry["iteration_count"] >= self._warmup_iterations:
-                # 预热完成，使用 Graph 重放
-                self._stats["cache_hits"] += 1
-                return self._replay_graph(cache_entry, input_ids, pos, **kwargs)
-            else:
-                # 仍在预热中
-                cache_entry["iteration_count"] += 1
-                self._stats["cache_misses"] += 1
-                return super().forward(input_ids=input_ids, pos=pos, **kwargs)
-        else:
-            self._stats["cache_misses"] += 1
-        
-        # 录制新 Graph
-        return self._record_and_execute(shape_key, input_ids, pos, **kwargs)
+        Returns:
+            {"shape_key": {"swiglu": True, "add_rms_norm": False}, ...}
+        """
+        if shape_key:
+            return self._fusion_decision_cache.get(shape_key, {})
+        return self._fusion_decision_cache
     
     def clear_cache(self):
-        """清空 Graph 缓存"""
         self._graph_cache.clear()
+        self._fusion_decision_cache.clear()
         self._stats = {
-            "cache_hits": 0,
-            "cache_misses": 0,
+            "cache_hits": 0, 
+            "cache_misses": 0, 
             "recordings": 0,
+            "fusion_decisions": 0,
         }
     
     def get_stats(self) -> Dict[str, Any]:
-        """获取统计信息"""
         return {
             "enabled": self._enable_fusion,
+            "fusion_scheduler_available": self.fusion_scheduler_available,
+            "patterns_count": len(self._fusion_patterns),
             "cache_size": len(self._graph_cache),
-            "cache_hits": self._stats["cache_hits"],
-            "cache_misses": self._stats["cache_misses"],
-            "recordings": self._stats["recordings"],
-            "cached_shapes": list(self._graph_cache.keys()),
+            "decision_cache_size": len(self._fusion_decision_cache),
+            **self._stats,
+            "fusion_decisions_by_shape": self._fusion_decision_cache,
         }
     
     def __repr__(self) -> str:
-        stats = self.get_stats()
         return (
             f"<FusedInferEngine "
             f"fusion={'ON' if self._enable_fusion else 'OFF'} "
-            f"cache_size={stats['cache_size']} "
-            f"hits={stats['cache_hits']} misses={stats['cache_misses']}>"
+            f"patterns={len(self._fusion_patterns)} "
+            f"decisions_cached={len(self._fusion_decision_cache)}>"
         )
