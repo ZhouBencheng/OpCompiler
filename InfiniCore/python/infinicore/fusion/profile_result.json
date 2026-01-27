@@ -1,0 +1,12 @@
+{
+  "single": {
+    "add": 0.0224,
+    "rms_norm": 0.1607,
+    "mul": 0.0525,
+    "silu": 0.0556
+  },
+  "fused": {
+    "add+rms_norm": 0.1261792,
+    "silu+mul": 0.1080
+  }
+}
