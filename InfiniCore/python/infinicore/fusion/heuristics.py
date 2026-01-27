@@ -118,7 +118,59 @@ class FusionHeuristics:
         """根据拓扑顺序生成子图 op key，例如 'add+rms_norm'"""
         return "+".join(node.op_type for node in graph.nodes)
 
-    # ---------------- main API ----------------
+    def _parse_shape_key(self, shape_key: str) -> Tuple[int, ...]:
+        # "[1, 512, 4096]" -> (1, 512, 4096)
+        return tuple(int(x.strip()) for x in shape_key.strip("[]").split(","))
+
+    def _lookup_nearest_shape( # “就近 bucket”查找函数
+        self,
+        shape_key: str,
+        shape_map: Dict[str, Any],
+    ) -> Optional[Any]:
+        """
+        在 shape_map 中查找与 shape_key 最接近的 bucket。
+        规则：
+        - rank 必须一致
+        - B 和 H 必须完全一致
+        - 只在 token(S) 维度做 lower-bound
+        """
+        target = self._parse_shape_key(shape_key)
+
+        best_key = None
+        best_s = None
+
+        for k in shape_map.keys():
+            try:
+                cand = self._parse_shape_key(k)
+            except Exception:
+                continue
+
+            if len(cand) != len(target):
+                continue
+
+            # 固定 B 和 H
+            if cand[0] != target[0] or cand[-1] != target[-1]:
+                continue
+
+            s = cand[1]
+            if s <= target[1]:
+                if best_s is None or s > best_s:
+                    best_s = s
+                    best_key = k
+
+        # 如果所有 bucket 的 S 都 > target.S，则取最小的那个
+        if best_key is None:
+            for k in shape_map.keys():
+                try:
+                    cand = self._parse_shape_key(k)
+                except Exception:
+                    continue
+                if len(cand) == len(target) and cand[0] == target[0] and cand[-1] == target[-1]:
+                    best_key = k
+                    break
+
+        return shape_map.get(best_key) if best_key else None
+
 
     def should_fuse(
         self,
@@ -190,8 +242,13 @@ class FusionHeuristics:
             print(f"[Fusion][Error] Invalid profile structure for op='{op_key}': {e}")
             return False
         
-        t_unfused = unfused_map.get(shape_key, None)
-        t_fused = fused_map.get(shape_key, None)
+        t_unfused = unfused_map.get(shape_key)
+        if t_unfused is None:
+            t_unfused = self._lookup_nearest_shape(shape_key, unfused_map)
+
+        t_fused = fused_map.get(shape_key)
+        if t_fused is None:
+            t_fused = self._lookup_nearest_shape(shape_key, fused_map)
 
         if t_unfused is None or t_fused is None:
             print(
