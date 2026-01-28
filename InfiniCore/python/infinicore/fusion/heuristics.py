@@ -187,6 +187,7 @@ class FusionHeuristics:
         特殊规则：
         - profile 缺失/异常：print 错误信息并返回 False
         """
+        return self.config.enable_fusion
         # 规则 0: 总开关检查
         if not self.config.enable_fusion:
             return False
